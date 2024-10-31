@@ -1,0 +1,243 @@
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.9;
+
+import {ECDSAServiceManagerBase} from
+    "@eigenlayer-middleware/src/unaudited/ECDSAServiceManagerBase.sol";
+import {ECDSAStakeRegistry} from "@eigenlayer-middleware/src/unaudited/ECDSAStakeRegistry.sol";
+import {IServiceManager} from "@eigenlayer-middleware/src/interfaces/IServiceManager.sol";
+import {ECDSAUpgradeable} from
+    "@openzeppelin-upgrades/contracts/utils/cryptography/ECDSAUpgradeable.sol";
+import {IERC1271Upgradeable} from "@openzeppelin-upgrades/contracts/interfaces/IERC1271Upgradeable.sol";
+import {IHelloWorldServiceManager} from "./IHelloWorldServiceManager.sol";
+import "@openzeppelin/contracts/utils/Strings.sol";
+import "@eigenlayer/contracts/interfaces/IRewardsCoordinator.sol";
+
+contract HelloWorldServiceManager is ECDSAServiceManagerBase, IHelloWorldServiceManager {
+    using ECDSAUpgradeable for bytes32;
+
+    uint32 public latestTaskNum;
+    uint32 public constant REQUIRED_VALIDATIONS = 1; // Минимальное количество валидаций
+    uint256 public constant VALIDATION_TIMEOUT = 1 hours; // Таймаут для валидации
+
+    // Маппинги для базовой функциональности Hello World
+    mapping(uint32 => bytes32) public allTaskHashes;
+    mapping(address => mapping(uint32 => bytes)) public allTaskResponses;
+
+    // Структура для Pastebin задачи
+    struct PasteContent {
+        uint256 id;
+        address creator;
+        string content;
+        uint256 timestamp;
+        bool isValidated;
+        uint32 validationsCount;
+        mapping(address => bool) validatedBy;
+        bool isPublished;
+    }
+
+    // Хранение паст
+    mapping(uint256 => PasteContent) public pastes;
+    uint256 public pasteCount;
+
+    // События
+    event PasteCreated(
+        uint256 indexed id, 
+        address indexed creator, 
+        string content, 
+        uint256 timestamp
+    );
+    event PasteValidated(
+        uint256 indexed id, 
+        address indexed operator, 
+        bool approved, 
+        string reason
+    );
+    event PastePublished(
+        uint256 indexed id, 
+        uint32 validationsCount, 
+        uint256 timestamp
+    );
+    event PasteRejected(
+        uint256 indexed id, 
+        string reason, 
+        uint256 timestamp
+    );
+    
+    constructor(
+        address _avsDirectory,
+        address _stakeRegistry,
+        address _rewardsCoordinator,
+        address _delegationManager
+    )
+        ECDSAServiceManagerBase(
+            _avsDirectory,
+            _stakeRegistry,
+            _rewardsCoordinator,
+            _delegationManager
+        )
+    {}
+
+    // Базовая функциональность Hello World (оставляем без изменений)
+    function createNewTask(
+        string memory name
+    ) external returns (Task memory) {
+        Task memory newTask;
+        newTask.name = name;
+        newTask.taskCreatedBlock = uint32(block.number);
+
+        allTaskHashes[latestTaskNum] = keccak256(abi.encode(newTask));
+        emit NewTaskCreated(latestTaskNum, newTask);
+        latestTaskNum = latestTaskNum + 1;
+
+        return newTask;
+    }
+
+    function respondToTask(
+        Task calldata task,
+        uint32 referenceTaskIndex,
+        bytes memory signature
+    ) external onlyOperator {
+        require(
+            keccak256(abi.encode(task)) == allTaskHashes[referenceTaskIndex],
+            "Invalid task data"
+        );
+        require(
+            allTaskResponses[msg.sender][referenceTaskIndex].length == 0,
+            "Operator already responded"
+        );
+
+        bytes32 messageHash = keccak256(abi.encodePacked("Hello, ", task.name));
+        bytes32 ethSignedMessageHash = messageHash.toEthSignedMessageHash();
+        
+        bytes4 magicValue = IERC1271Upgradeable.isValidSignature.selector;
+        require(
+            magicValue == ECDSAStakeRegistry(stakeRegistry).isValidSignature(ethSignedMessageHash, signature),
+            "Invalid signature"
+        );
+
+        allTaskResponses[msg.sender][referenceTaskIndex] = signature;
+        emit TaskResponded(referenceTaskIndex, task, msg.sender);
+    }
+
+    // Функции для работы с пастами
+    function createPaste(string calldata content) external returns (uint256) {
+        require(bytes(content).length > 0, "Content cannot be empty");
+        require(bytes(content).length <= 10000, "Content too long");
+        
+        uint256 pasteId = pasteCount;
+        
+        PasteContent storage newPaste = pastes[pasteId];
+        newPaste.id = pasteId;
+        newPaste.creator = msg.sender;
+        newPaste.content = content;
+        newPaste.timestamp = block.timestamp;
+        newPaste.isValidated = false;
+        newPaste.validationsCount = 0;
+        newPaste.isPublished = false;
+        
+        emit PasteCreated(pasteId, msg.sender, content, block.timestamp);
+        
+        pasteCount++;
+        return pasteId;
+    }
+
+    function validatePaste(
+        uint256 pasteId, 
+        bool approved, 
+        string calldata reason,
+        bytes memory signature
+    ) external onlyOperator {
+        require(pasteId < pasteCount, "Paste does not exist");
+        
+        PasteContent storage paste = pastes[pasteId];
+        require(!paste.isValidated, "Paste already validated");
+        require(!paste.validatedBy[msg.sender], "Operator already validated");
+        require(
+            block.timestamp <= paste.timestamp + VALIDATION_TIMEOUT,
+            "Validation timeout exceeded"
+        );
+
+        // Проверяем подпись оператора
+        bytes32 messageHash = keccak256(abi.encodePacked(paste.content));
+        bytes32 ethSignedMessageHash = messageHash.toEthSignedMessageHash();
+        
+        bytes4 magicValue = IERC1271Upgradeable.isValidSignature.selector;
+        require(
+            magicValue == ECDSAStakeRegistry(stakeRegistry).isValidSignature(ethSignedMessageHash, signature),
+            "Invalid signature"
+        );
+
+        // Записываем валидацию
+        paste.validatedBy[msg.sender] = true;
+        paste.validationsCount++;
+
+        emit PasteValidated(pasteId, msg.sender, approved, reason);
+
+        // Проверяем достаточно ли валидаций
+        if (paste.validationsCount >= REQUIRED_VALIDATIONS) {
+            paste.isValidated = true;
+            if (approved) {
+                paste.isPublished = true;
+                emit PastePublished(pasteId, paste.validationsCount, block.timestamp);
+            } else {
+                emit PasteRejected(pasteId, reason, block.timestamp);
+            }
+        }
+    }
+
+    function getPaste(uint256 id) external view returns (
+        uint256 pasteId,
+        address creator,
+        string memory content,
+        uint256 timestamp,
+        bool isValidated,
+        uint32 validationsCount,
+        bool isPublished
+    ) {
+        require(id < pasteCount, "Paste does not exist");
+        PasteContent storage paste = pastes[id];
+        
+        // Возвращаем только опубликованные пасты
+        require(paste.isPublished, "Paste not published");
+
+        return (
+            paste.id,
+            paste.creator,
+            paste.content,
+            paste.timestamp,
+            paste.isValidated,
+            paste.validationsCount,
+            paste.isPublished
+        );
+    }
+
+    function getPasteValidationStatus(uint256 id) external view returns (
+        bool isValidated,
+        uint32 validationsCount,
+        uint32 requiredValidations,
+        bool isPublished
+    ) {
+        require(id < pasteCount, "Paste does not exist");
+        PasteContent storage paste = pastes[id];
+        
+        return (
+            paste.isValidated,
+            paste.validationsCount,
+            REQUIRED_VALIDATIONS,
+            paste.isPublished
+        );
+    }
+
+    function hasOperatorValidated(uint256 id, address operator) external view returns (bool) {
+        require(id < pasteCount, "Paste does not exist");
+        return pastes[id].validatedBy[operator];
+    }
+
+    modifier onlyOperator() {
+        require(
+            ECDSAStakeRegistry(stakeRegistry).operatorRegistered(msg.sender),
+            "Operator must be the caller"
+        );
+        _;
+    }
+}
